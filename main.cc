@@ -17,6 +17,8 @@
 #include <_types/_uint8_t.h>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
+#include <iterator>
 #include <stdint.h>
 #include <assert.h>
 #include <string.h>
@@ -146,7 +148,6 @@ typedef struct {
     uint32_t ESCR_extension;
     uint32_t ES_rate;
 
-
     ts_packet pkt;
 } ts_pes;
 
@@ -198,9 +199,18 @@ size_t pmt_read(ts_pmt* pmt, const uint8_t* data, size_t bytes);
 size_t pes_read_header(ts_pes* pes, const uint8_t* data, size_t bytes);
 
 
-int pes_packet(ts_packet *pkt, const ts_pes *pes, const uint8_t *data, size_t size, int start) {
+int ts_packet_h264_h265_filter(ts_packet *pkt, const ts_pes *pes, size_t size) {
+    const uint8_t * data , *end;
 
+    printf("pkt->dts=%lld pkt->pts=%lld pkt->cts=%lld, pkt->codecid=%d\n", pes->dts, pes->pts, pes->pts-pes->dts, pes->stream_type);
+    return 0;
+}
+
+
+int pes_packet(ts_packet *pkt, const ts_pes *pes, const uint8_t *data, size_t size, int start) {
     if (pes->stream_type == PSI_STREAM_H264 || pes->stream_type == PSI_STREAM_H265) {
+
+        ts_packet_h264_h265_filter(pkt, pes, size);
     }
     else {
     }
@@ -277,6 +287,7 @@ int ts_demuxer_input(ts_demuxer *ts, const uint8_t* data, size_t bytes) {
 
 	PID = (data[1] << 8 | data[2]) & 0x1FFF;
 	memset(&pkhd, 0, sizeof(pkhd));
+    memset(&pkhd.adaptation, 0, sizeof(pkhd.adaptation));
 	pkhd.transport_error_indicator = (data[1] >> 7) & 0x01;
 	pkhd.payload_unit_start_indicator = (data[1] >> 6) & 0x01;
 	pkhd.transport_priority = (data[1] >> 5) & 0x01;
@@ -284,18 +295,21 @@ int ts_demuxer_input(ts_demuxer *ts, const uint8_t* data, size_t bytes) {
 	pkhd.adaptation_field_control = (data[3] >> 4) & 0x03;
 	pkhd.continuity_counter = (data[3]) & 0x0F;
 
-	if ((ts->cc + 1) % 15 != (uint8_t)pkhd.continuity_counter) {
-		// 如果包不是连续的 
+	if (((ts->cc + 1) % 15) != (uint8_t)pkhd.continuity_counter) {
+		// PAT/PMT Reset
 	}
-
 	ts->cc = (uint8_t)pkhd.continuity_counter;
 
 	// 打印出每个包的头部信息
-
 	i = 4;
 	if (0x02 & pkhd.adaptation_field_control) {
 		// 仅有适应域
         i += adaptation_field_read(&pkhd.adaptation, data + i, bytes - i);
+        if (pkhd.adaptation.adaptation_field_length > 0 && pkhd.adaptation.PCR_flag) {
+            int64_t t;
+            t = pkhd.adaptation.program_clock_reference_base / 90L;
+            // printf("timebase=%lld\n", t);
+        }
 	}
 
 	if (0x01 & pkhd.adaptation_field_control) {
@@ -309,14 +323,6 @@ int ts_demuxer_input(ts_demuxer *ts, const uint8_t* data, size_t bytes) {
 			}
 			pat_read(&ts->pat, data + i, bytes - i);
 			break;
-		case TS_PID_CAT:
-			// CAT
-		case TS_PID_TSDT:
-			// TSDT
-		case TS_PID_IPMP:
-			// IPMP
-		case TS_PID_NIT:
-			// NIT
 		case TS_PID_SDT:
 			// SDT
 			if (pkhd.payload_unit_start_indicator) {
@@ -350,8 +356,7 @@ int ts_demuxer_input(ts_demuxer *ts, const uint8_t* data, size_t bytes) {
                         else if (0 == pes->sid) {
                             continue;
                         }
-
-                        // pes_packet(&pes->pkt, pes, data + i, bytes - i, pkhd.payload_unit_start_indicator);
+                        pes_packet(&pes->pkt, pes, data + i, bytes - i, pkhd.payload_unit_start_indicator);
                         break;
                     }      
                 }
@@ -606,6 +611,7 @@ void read_file(const char* path) {
 	}
 	ts_demuxer muxer;
 	memset(&muxer, 0, sizeof(muxer));
+	memset(&muxer.pat, 0, sizeof(muxer.pat));
 	char buf[188] = { 0 };
 	int count = 0;
     while (true)
