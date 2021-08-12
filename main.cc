@@ -11,10 +11,6 @@
 */
 
 
-#include <_types/_uint16_t.h>
-#include <_types/_uint32_t.h>
-#include <_types/_uint64_t.h>
-#include <_types/_uint8_t.h>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -22,8 +18,6 @@
 #include <stdint.h>
 #include <assert.h>
 #include <string.h>
-#include <sys/_types/_int64_t.h>
-#include <sys/_types/_size_t.h>
 #include <vector>
 #include <stdio.h>
 #include <stdlib.h>
@@ -149,6 +143,7 @@ typedef struct {
     uint32_t ES_rate;
 
     ts_packet pkt;
+	uint32_t pkt_count;
 } ts_pes;
 
 typedef struct {
@@ -189,6 +184,7 @@ enum ETS_PID {
 };
 
 enum STREAM_TYPE {
+	PSI_STREAM_AAC 	= 0x0f,
     PSI_STREAM_H264 = 0x1b,
     PSI_STREAM_H265 = 0x24
 };
@@ -202,14 +198,12 @@ size_t pes_read_header(ts_pes* pes, const uint8_t* data, size_t bytes);
 int ts_packet_h264_h265_filter(ts_packet *pkt, const ts_pes *pes, size_t size) {
     const uint8_t * data , *end;
 
-    printf("pkt->dts=%lld pkt->pts=%lld pkt->cts=%lld, pkt->codecid=%d\n", pes->dts, pes->pts, pes->pts-pes->dts, pes->stream_type);
     return 0;
 }
 
 
 int pes_packet(ts_packet *pkt, const ts_pes *pes, const uint8_t *data, size_t size, int start) {
     if (pes->stream_type == PSI_STREAM_H264 || pes->stream_type == PSI_STREAM_H265) {
-
         ts_packet_h264_h265_filter(pkt, pes, size);
     }
     else {
@@ -312,6 +306,9 @@ int ts_demuxer_input(ts_demuxer *ts, const uint8_t* data, size_t bytes) {
         }
 	}
 
+	static int frames = 0;
+	static int aframes = 0;
+
 	if (0x01 & pkhd.adaptation_field_control) {
 		// 仅有负载
 		switch (PID)
@@ -342,21 +339,32 @@ int ts_demuxer_input(ts_demuxer *ts, const uint8_t* data, size_t bytes) {
                     break;
                 } else {
                     for (uint32_t k = 0; k < ts->pat.pat_programs[j].stream_count; k++) {
-                        ts_pes * pes = &ts->pat.pat_programs[j].pmt_streams[k];
+						ts_pes * pes = &ts->pat.pat_programs[j].pmt_streams[k];
+						if (pes == 0) {
+							break;
+						}
                         if (PID != pes->elementary_PID) {
                             continue;
                         }
-
+						// 几个PES包组成一帧数据 如果要获取一帧数据 需要把连续的几个TS包里面的数据全部取出来合成一个PES
                         if (pkhd.payload_unit_start_indicator) {
-                            size_t n;
+							size_t n;
                             n = pes_read_header(pes, data + i, bytes - i);
                             assert(n > 0);
                             i += n;
-                        }
-                        else if (0 == pes->sid) {
-                            continue;
+							if (pes->stream_type == PSI_STREAM_H264 || pes->stream_type == PSI_STREAM_H265) {
+								printf("[FRAMES]=%d pts=%ld dts=%ld cts=%ld\n", frames, pes->pts, pes->dts, pes->pts - pes->dts);
+								frames++;
+							}
+							if (pes->stream_type == PSI_STREAM_AAC) {
+								printf("[AFRAMES]=%d pts=%ld dts=%ld\n", aframes, pes->pts, pes->dts);
+								aframes++;
+							}
+							pes->pkt_count = 0;
+
                         }
                         pes_packet(&pes->pkt, pes, data + i, bytes - i, pkhd.payload_unit_start_indicator);
+						pes->pkt_count++;
                         break;
                     }      
                 }
@@ -441,6 +449,7 @@ size_t pat_read(ts_pat* pat, const uint8_t* data, size_t bytes) {
 
 	if (pat->ver != version_number) {
 		pat->pmt_count = 0;
+		pat->pat_programs.clear();
 	}
 
 	pat->tsid = transport_stream_id;
@@ -460,12 +469,17 @@ size_t pat_read(ts_pat* pat, const uint8_t* data, size_t bytes) {
 			// 节目号为0x0000 表示这是NIT
 			continue;
 		}
-		// pn = 0x0001 表示这是 PMT
-		ts_pmt prg;
-		prg.program_number = pn;
-		prg.pid = pid;
-		pat->pat_programs.push_back(prg);
-		pat->pmt_count++;
+
+		if (pn == 1) 
+		{
+			// pn = 0x0001 表示这是 PMT
+			ts_pmt prg;
+			prg.program_number = pn;
+			prg.pid = pid;
+			pat->pat_programs.push_back(prg);
+			pat->pmt_count++;
+		}
+	
 	}
 
 	// 最好再验证一下CRC32
@@ -493,6 +507,7 @@ size_t pmt_read(ts_pmt* pmt, const uint8_t* data, size_t bytes) {
 
 	if (pmt->version_number != version_number) {
 		pmt->stream_count = 0;
+		pmt->pmt_streams.clear();
 	}
 
 	pmt->PCR_PID = PCR_PID;
