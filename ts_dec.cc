@@ -22,6 +22,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <errno.h>
+#include <inttypes.h>
 
 using namespace std;
 
@@ -120,7 +121,7 @@ typedef struct {
     // optional packet length
     uint32_t reversed10:2;
     uint32_t PES_scrambling_control:2;
-    uint32_t PES_prioriy:1;
+    uint32_t PES_priority:1;
     uint32_t data_alignment_indicator:1;
     uint32_t copyright:1;
     uint32_t original_or_copy:1;
@@ -189,26 +190,110 @@ enum STREAM_TYPE {
     PSI_STREAM_H265 = 0x24
 };
 
+enum FRAME_TYPE {
+	FRAME_NONE = 0,
+	FRAME_I = 1,
+	FRAME_P = 2,
+	FRAME_B = 3
+};
+
+enum TRACE_TYPE {
+	VIDEO = 1,
+	AUDIO = 2
+};
+
+typedef struct {
+	int64_t num;
+	int64_t dts;
+	int64_t pts;
+	uint8_t nal_type;
+	FRAME_TYPE frame_type;
+	TRACE_TYPE type;
+	// For audio
+	uint8_t channel_type;
+	uint32_t frequency;
+	uint8_t profile;
+} frame_info;
+
+
 size_t pat_read(ts_pat* pat, const uint8_t* data, size_t bytes);
 size_t sdt_read(ts_pat* pat, const uint8_t* data, size_t bytes);
 size_t pmt_read(ts_pmt* pmt, const uint8_t* data, size_t bytes);
 size_t pes_read_header(ts_pes* pes, const uint8_t* data, size_t bytes);
 
 
-int ts_packet_h264_h265_filter(ts_packet *pkt, const ts_pes *pes, size_t size) {
-    const uint8_t * data , *end;
-
-    return 0;
-}
-
-
-int pes_packet(ts_packet *pkt, const ts_pes *pes, const uint8_t *data, size_t size, int start) {
+frame_info pes_packet(ts_packet *pkt, const ts_pes *pes, const uint8_t *data, size_t size, int start) {
+	frame_info frame;
+	memset(&frame, 0, sizeof(frame));
     if (pes->stream_type == PSI_STREAM_H264 || pes->stream_type == PSI_STREAM_H265) {
-        ts_packet_h264_h265_filter(pkt, pes, size);
+		if (start && pes->stream_type == PSI_STREAM_H264) {
+			uint32_t i = 0;
+			uint8_t type = 0;
+			for (; i < size; ) {
+				uint32_t start_code = (data[i] << 24) | (data[i+1] << 16) | (data[i+2] << 8) | data[i+3];
+				if (start_code == 0x00000001) {
+					i += 4;
+				}
+				if (((start_code) >> 8 & 0x00000001) == 0x000001) {
+					i += 3;
+				}
+				uint8_t forbbiden = (data[i] >> 7) & 0x01;
+				assert(forbbiden == 0);
+				type = data[i] & 0x1F;
+				if (type == 9) { 
+					i += 2;
+					continue;
+				}
+				break;
+			}
+			frame.dts = pkt->dts;
+			frame.pts = pkt->pts;
+			frame.nal_type = type;
+			if (type == 5) {
+				frame.frame_type = FRAME_I;
+			}
+			else if (type == 1 || type == 2 || type == 3 || type == 4) {
+				frame.frame_type = (frame.pts == frame.dts) ? FRAME_P : FRAME_B;
+			}
+			else {
+				frame.frame_type = FRAME_NONE;
+			}
+			frame.type = VIDEO;
+		}
+		// Not support H265 yet
+		if (start && pes->stream_type == PSI_STREAM_H265) {
+			
+		}
     }
     else {
+		// Audio Only Support AAC
+		if (pes->stream_type == PSI_STREAM_AAC) {
+			if (false) {
+				// ADTS FRAME
+				uint32_t i = 0;
+				uint16_t syncword = ((data[i] << 4) | (data[i+1] & 0xF0) >> 4);
+				assert(syncword == 0xFFF);
+				i = 2;
+				uint8_t profile = data[i] >> 6;
+
+				static uint32_t frequencies[16] = {
+					96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 
+					16000, 12000, 11025, 8000,  0,     0,     0,     0
+				};
+				uint8_t frequency_idx = (data[i] >> 2) & 0x0F;
+				uint32_t frequency = frequencies[frequency_idx];
+				uint8_t channel_type = (data[i] & 0x01 << 2) | (data[i+1] >> 6);
+
+				frame.type = AUDIO;
+				frame.channel_type = channel_type;
+				frame.frequency = frequency;
+				frame.profile = profile;
+				frame.dts = pkt->dts;
+				frame.pts = pkt->pts;
+			}
+		}
     }
-    return 0;
+    return frame;
 }
 
 
@@ -270,7 +355,7 @@ static uint32_t adaptation_field_read(ts_adaptation_field *adp, const uint8_t *d
 } 
 
 
-int ts_demuxer_input(ts_demuxer *ts, const uint8_t* data, size_t bytes) {
+std::vector<frame_info> ts_demuxer_input(ts_demuxer *ts, const uint8_t* data, size_t bytes) {
 	assert(188 == bytes);
 	assert(0x47 == data[0]);
 
@@ -278,6 +363,8 @@ int ts_demuxer_input(ts_demuxer *ts, const uint8_t* data, size_t bytes) {
 	uint32_t i;
 
 	uint32_t PID;
+
+	std::vector<frame_info> frames;
 
 	PID = (data[1] << 8 | data[2]) & 0x1FFF;
 	memset(&pkhd, 0, sizeof(pkhd));
@@ -306,8 +393,7 @@ int ts_demuxer_input(ts_demuxer *ts, const uint8_t* data, size_t bytes) {
         }
 	}
 
-	static int frames = 0;
-	static int aframes = 0;
+	static int frame_count = 0;
 
 	if (0x01 & pkhd.adaptation_field_control) {
 		// 仅有负载
@@ -352,18 +438,15 @@ int ts_demuxer_input(ts_demuxer *ts, const uint8_t* data, size_t bytes) {
                             n = pes_read_header(pes, data + i, bytes - i);
                             assert(n > 0);
                             i += n;
-							if (pes->stream_type == PSI_STREAM_H264 || pes->stream_type == PSI_STREAM_H265) {
-								printf("[FRAMES]=%d pts=%ld dts=%ld cts=%ld\n", frames, pes->pts, pes->dts, pes->pts - pes->dts);
-								frames++;
-							}
-							if (pes->stream_type == PSI_STREAM_AAC) {
-								printf("[AFRAMES]=%d pts=%ld dts=%ld\n", aframes, pes->pts, pes->dts);
-								aframes++;
-							}
 							pes->pkt_count = 0;
 
                         }
-                        pes_packet(&pes->pkt, pes, data + i, bytes - i, pkhd.payload_unit_start_indicator);
+                        frame_info frame = pes_packet(&pes->pkt, pes, data + i, bytes - i, pkhd.payload_unit_start_indicator);
+						if (pkhd.payload_unit_start_indicator) {
+							frame_count++;
+							frame.num = frame_count;
+							frames.emplace_back(frame);
+						}
 						pes->pkt_count++;
                         break;
                     }      
@@ -373,7 +456,7 @@ int ts_demuxer_input(ts_demuxer *ts, const uint8_t* data, size_t bytes) {
 			break;
 		}
 	}
-	return 0;
+	return frames;
 }
 
 
@@ -415,7 +498,7 @@ size_t sdt_read(ts_pat* pat, const uint8_t* data, size_t bytes) {
 				continue;
 			}
 			// service type, service provider name , service name
-			uint32_t service_type = data[k + 2];
+			// uint32_t service_type = data[k + 2];
 			uint8_t provide_len = data[k + 3];
 			if (provide_len >= sizeof(pat->pat_programs[p].provider) || k + 3 + provide_len > i + 5 + n) {
 				continue;
@@ -458,7 +541,7 @@ size_t pat_read(ts_pat* pat, const uint8_t* data, size_t bytes) {
 	assert(bytes >= section_length + 3);
 	uint32_t i;
 	uint16_t pn, pid;
-	// - 5 fllow section length item  - 4 crc
+	// - 5 follow section length item  - 4 crc
 	for (i = 8; i + 4 <= section_length + 8 - 5 - 4; i += 4)
 	{
 		pn = (data[i] << 8) | data[i + 1];
@@ -495,9 +578,9 @@ size_t pmt_read(ts_pmt* pmt, const uint8_t* data, size_t bytes) {
 	uint32_t section_length = ((data[1] & 0x0F) << 8) | data[2];
 	uint16_t program_number = (data[3] << 8) | data[4];
 	uint8_t version_number = (data[5] >> 1) & 0x1F;
-	uint8_t current_next_indicator = data[5] & 0x01;
-	uint32_t sector_number = data[6];
-	uint32_t last_sector_number = data[7];
+	// uint8_t current_next_indicator = data[5] & 0x01;
+	// uint32_t sector_number = data[6];
+	// uint32_t last_sector_number = data[7];
 	uint32_t PCR_PID = ((data[8] & 0x1F) << 8) | data[9];
 	uint32_t program_info_length = ((data[10] & 0x0F) << 8) | data[11];
 
@@ -568,7 +651,7 @@ size_t pes_read_header(ts_pes* pes, const uint8_t* data, size_t bytes) {
     i = 6;
     assert(0x02 == (DATA(i) >> 6 & 0x03));
     pes->PES_scrambling_control = (DATA(i) >> 4) & 0x03;
-    pes->PES_prioriy = (DATA(i) >> 3) & 0x01;
+    pes->PES_priority = (DATA(i) >> 3) & 0x01;
     pes->data_alignment_indicator = (DATA(i) >> 2) & 0x01;
     pes->copyright = (DATA(i) >> 1) & 0x01;
     pes->original_or_copy = (DATA(i) & 0x01);
@@ -628,23 +711,58 @@ void read_file(const char* path) {
 	memset(&muxer, 0, sizeof(muxer));
 	memset(&muxer.pat, 0, sizeof(muxer.pat));
 	char buf[188] = { 0 };
-	int count = 0;
     while (true)
 	{
 		size_t n = fread(buf, 1, sizeof(buf), fp);
 		if (feof(fp)) break;
 		assert(n == 188);
-		ts_demuxer_input(&muxer, (uint8_t*)buf, n);
-        count++;
+		std::vector<frame_info> frames = ts_demuxer_input(&muxer, (uint8_t*)buf, n);
+		for (auto & it : frames) {
+			if (it.type == VIDEO) {
+				char type;
+				if (it.frame_type == FRAME_I) {
+					type = 'I';
+				}
+				else if (it.frame_type == FRAME_B) {
+					type = 'B';
+				}
+				else if (it.frame_type == FRAME_P) {
+					type = 'P';
+				}
+				else {
+					type = 'U';
+				}
+				printf("[NUM=%6" PRId64"] [Video] [Frame_type=%c] [DTS=%" PRId64"] [PTS=%" PRId64"] [CTS=%" PRId64"] [NAL_TYPE=%" PRIu8"]\n", 
+					it.num, type, it.dts, it.pts, it.pts - it.dts, it.nal_type);
+			}
+			else if (it.type == AUDIO) {
+				char profile[8];
+				memset(profile, 0, sizeof(profile));
+				if (it.profile == 0) {
+					snprintf(profile, 8, "Main");
+				}
+				else if (it.profile == 1) {
+					snprintf(profile, 8, "LC");
+				}
+				else if (it.profile == 2) {
+					snprintf(profile, 8, "SSR");
+				}
+				else {
+					snprintf(profile, 8, "Unkown");
+				}
+				printf("[NUM=%6" PRId64"] [Audio] [PTS=%" PRId64"] [Freq=%" PRIu32"Hz] [Profile=%s] [Channel=%" PRIu8"]\n", 
+					it.num, it.pts, it.frequency, profile, it.channel_type);
+			}
+		}
 	}
 	fclose(fp);
-    printf("packet count = %d\n", count);
 }
 
 
 int main(int argc, char** argv) {
 	if (argc != 2) {
-		fprintf(stderr, "invalid command argments\n");
+		fprintf(stderr, "invalid command argment\n");
+		fprintf(stdout, "run: [Program] [asset path]\n");
 		return -1;
 	}
 	read_file(argv[1]);
